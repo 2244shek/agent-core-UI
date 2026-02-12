@@ -1,12 +1,14 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-// import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Search, Send, Bot, User } from "lucide-react";
+import { v4 as uuidv4 } from 'uuid';
+import { useSearchParams, useRouter } from "next/navigation";
 
 interface Message {
     role: "human" | "ai" | "tool";
@@ -17,14 +19,57 @@ export default function ChatPage() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState("");
     const [isLoading, setIsLoading] = useState(false);
-    const scrollRef = useRef<HTMLDivElement>(null);
+    const [currentSessionId, setCurrentSessionId] = useState<string>("");
+    const [streamingMessage, setStreamingMessage] = useState<string>(""); // For smooth streaming
 
-    // Auto-scroll to bottom when messages update
+    const scrollRef = useRef<HTMLDivElement>(null);
+    const searchParams = useSearchParams();
+    const router = useRouter();
+
+    // 1. Initialize or Update Session ID
+    useEffect(() => {
+        const session = searchParams.get("session");
+        if (session) {
+            setCurrentSessionId(session);
+        } else {
+            const newId = uuidv4();
+            setCurrentSessionId(newId);
+            // Update URL so sidebar can detect the new session
+            router.replace(`?session=${newId}`);
+        }
+    }, [searchParams, router]);
+
+    // 2. Load History based on currentSessionId
+    const loadHistory = useCallback(async () => {
+        if (!currentSessionId) return;
+
+        try {
+            const response = await fetch(`http://localhost:8000/api/v1/agent/history/${currentSessionId}`);
+            if (!response.ok) throw new Error("History not found");
+            const data = await response.json();
+            setMessages(data.map((m: any) => ({
+                role: m.role,
+                content: m.content
+            })));
+        } catch (error) {
+            console.error("Failed to load history:", error);
+            setMessages([]);
+        }
+    }, [currentSessionId]);
+
+    useEffect(() => {
+        loadHistory();
+    }, [loadHistory]);
+
+    // Auto-scroll logic
     useEffect(() => {
         if (scrollRef.current) {
-            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+            const scrollContainer = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]');
+            if (scrollContainer) {
+                scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            }
         }
-    }, [messages]);
+    }, [messages, streamingMessage]);
 
     const handleSendMessage = async () => {
         if (!input.trim() || isLoading) return;
@@ -32,48 +77,53 @@ export default function ChatPage() {
         const userMessage = input.trim();
         setInput("");
         setIsLoading(true);
+        setStreamingMessage(""); // Reset streaming buffer
 
-        // Add user message to UI
         setMessages((prev) => [...prev, { role: "human", content: userMessage }]);
 
         try {
-            // For now, using 'test-session' - we will make this dynamic later
-            const response = await fetch(`http://localhost:8000/api/v1/agent/chat/test-session`, {
+            const response = await fetch(`http://localhost:8000/api/v1/agent/chat`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ message: userMessage }),
+                body: JSON.stringify({
+                    message: userMessage,
+                    session_id: currentSessionId
+                }),
             });
 
             if (!response.body) return;
 
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
-            let aiResponse = "";
+            let accumulatedAiResponse = "";
 
             while (true) {
                 const { value, done } = await reader.read();
                 if (done) break;
 
-                const chunk = decoder.decode(value);
+                const chunk = decoder.decode(value, { stream: true });
                 const lines = chunk.split("\n\n");
 
-                lines.forEach((line) => {
+                for (const line of lines) {
                     if (line.startsWith("data: ")) {
-                        const data = JSON.parse(line.replace("data: ", ""));
-
-                        if (data.type === "tool") {
-                            // Add a tool log
-                            setMessages((prev) => [...prev, { role: "tool", content: data.content }]);
-                        } else if (data.type === "text") {
-                            // Append to the AI response
-                            aiResponse = data.content;
+                        try {
+                            const data = JSON.parse(line.replace("data: ", ""));
+                            if (data.type === "tool") {
+                                setMessages((prev) => [...prev, { role: "tool", content: data.content }]);
+                            } else if (data.type === "text") {
+                                accumulatedAiResponse = data.content;
+                                setStreamingMessage(accumulatedAiResponse); // Update the visual buffer
+                            }
+                        } catch (e) {
+                            console.error("Error parsing JSON chunk", e);
                         }
                     }
-                });
+                }
             }
 
-            // After streaming is done, add the final AI message
-            setMessages((prev) => [...prev, { role: "ai", content: aiResponse }]);
+            // Commit final message to state and clear buffer
+            setMessages((prev) => [...prev, { role: "ai", content: accumulatedAiResponse }]);
+            setStreamingMessage("");
         } catch (error) {
             console.error("Failed to fetch:", error);
         } finally {
@@ -83,9 +133,8 @@ export default function ChatPage() {
 
     return (
         <div className="flex flex-col h-full max-w-4xl mx-auto w-full p-4">
-            {/* Chat History Area */}
             <ScrollArea className="flex-1 pr-4" ref={scrollRef}>
-                <div className="space-y-4 pb-4">
+                <div className="space-y-4 pb-4" style={{maxHeight: "75vh"}}>
                     {messages.map((msg, i) => (
                         <div key={i} className={`flex ${msg.role === "human" ? "justify-end" : "justify-start"}`}>
                             {msg.role === "tool" ? (
@@ -94,21 +143,31 @@ export default function ChatPage() {
                                     {msg.content}
                                 </div>
                             ) : (
-                                <Card className={`max-w-[80%] p-3 shadow-sm ${msg.role === "human" ? "bg-primary text-primary-foreground" : "bg-card"
-                                    }`}>
+                                <Card className={`max-w-[80%] p-3 shadow-sm ${msg.role === "human" ? "bg-primary text-primary-foreground" : "bg-card"}`}>
                                     <div className="flex items-start gap-3">
                                         {msg.role === "ai" && <Bot className="w-5 h-5 mt-1 text-blue-500" />}
-                                        <p className="text-sm leading-relaxed">{msg.content}</p>
+                                        <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
                                         {msg.role === "human" && <User className="w-5 h-5 mt-1 opacity-70" />}
                                     </div>
                                 </Card>
                             )}
                         </div>
                     ))}
+
+                    {/* Visual buffer for real-time streaming */}
+                    {streamingMessage && (
+                        <div className="flex justify-start">
+                            <Card className="max-w-[80%] p-3 shadow-sm bg-card">
+                                <div className="flex items-start gap-3">
+                                    <Bot className="w-5 h-5 mt-1 text-blue-500" />
+                                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{streamingMessage}</p>
+                                </div>
+                            </Card>
+                        </div>
+                    )}
                 </div>
             </ScrollArea>
 
-            {/* Input Area */}
             <div className="pt-4 border-t border-border">
                 <div className="flex gap-2">
                     <Input
@@ -117,14 +176,12 @@ export default function ChatPage() {
                         onChange={(e) => setInput(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
                         className="bg-muted/50 border-border"
+                        disabled={isLoading}
                     />
-                    <Button onClick={handleSendMessage} disabled={isLoading} size="icon">
+                    <Button onClick={handleSendMessage} disabled={isLoading || !input.trim()} size="icon">
                         <Send className="w-4 h-4" />
                     </Button>
                 </div>
-                <p className="text-[10px] text-center text-muted-foreground mt-2">
-                    Agent Core v1.0 | Powered by FastAPI & LangGraph
-                </p>
             </div>
         </div>
     );

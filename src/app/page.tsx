@@ -6,9 +6,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Card } from "@/components/ui/card";
-import { Search, Send, Bot, User } from "lucide-react";
+import { Search, Send, Bot, Sparkles, Loader2, User } from "lucide-react";
 import { v4 as uuidv4 } from 'uuid';
 import { useSearchParams, useRouter } from "next/navigation";
+import { motion, AnimatePresence } from "framer-motion";
+import { Badge } from "@/components/ui/badge";
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface Message {
     role: "human" | "ai" | "tool";
@@ -20,166 +24,197 @@ export default function ChatPage() {
     const [input, setInput] = useState("");
     const [isLoading, setIsLoading] = useState(false);
     const [currentSessionId, setCurrentSessionId] = useState<string>("");
-    const [streamingMessage, setStreamingMessage] = useState<string>(""); // For smooth streaming
+    const [streamingMessage, setStreamingMessage] = useState<string>("");
 
     const scrollRef = useRef<HTMLDivElement>(null);
     const searchParams = useSearchParams();
     const router = useRouter();
 
-    // 1. Initialize or Update Session ID
-    useEffect(() => {
-        const session = searchParams.get("session");
-        if (session) {
-            setCurrentSessionId(session);
-        } else {
-            const newId = uuidv4();
-            setCurrentSessionId(newId);
-            // Update URL so sidebar can detect the new session
-            router.replace(`?session=${newId}`);
-        }
-    }, [searchParams, router]);
+    const sessionIdFromUrl = searchParams.get("session");
 
-    // 2. Load History based on currentSessionId
+    useEffect(() => {
+        if (sessionIdFromUrl) {
+            setCurrentSessionId(sessionIdFromUrl);
+        } else {
+            setCurrentSessionId(""); // No session = Welcome Screen
+            setMessages([]);
+        }
+    }, [sessionIdFromUrl]);
+
     const loadHistory = useCallback(async () => {
         if (!currentSessionId) return;
-
+        setIsLoading(true);
         try {
             const response = await fetch(`http://localhost:8000/api/v1/agent/history/${currentSessionId}`);
             if (!response.ok) throw new Error("History not found");
             const data = await response.json();
-            setMessages(data.map((m: any) => ({
-                role: m.role,
-                content: m.content
-            })));
+            setMessages(data.map((m: any) => ({ role: m.role, content: m.content })));
         } catch (error) {
-            console.error("Failed to load history:", error);
-            setMessages([]);
+            console.error("History fetch error:", error);
+        } finally {
+            setIsLoading(false);
         }
     }, [currentSessionId]);
 
     useEffect(() => {
-        loadHistory();
-    }, [loadHistory]);
+        if (currentSessionId) loadHistory();
+    }, [loadHistory, currentSessionId]);
 
-    // Auto-scroll logic
     useEffect(() => {
         if (scrollRef.current) {
-            const scrollContainer = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]');
-            if (scrollContainer) {
-                scrollContainer.scrollTop = scrollContainer.scrollHeight;
-            }
+            const viewport = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]');
+            if (viewport) viewport.scrollTop = viewport.scrollHeight;
         }
     }, [messages, streamingMessage]);
 
     const handleSendMessage = async () => {
         if (!input.trim() || isLoading) return;
 
+        let targetId = currentSessionId;
+        if (!targetId) {
+            targetId = uuidv4();
+            setCurrentSessionId(targetId);
+            router.push(`/?session=${targetId}`);
+        }
+
         const userMessage = input.trim();
         setInput("");
         setIsLoading(true);
-        setStreamingMessage(""); // Reset streaming buffer
-
         setMessages((prev) => [...prev, { role: "human", content: userMessage }]);
 
         try {
             const response = await fetch(`http://localhost:8000/api/v1/agent/chat`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    message: userMessage,
-                    session_id: currentSessionId
-                }),
+                body: JSON.stringify({ message: userMessage, session_id: targetId }),
             });
 
             if (!response.body) return;
-
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
-            let accumulatedAiResponse = "";
+            let accumulatedText = "";
 
             while (true) {
                 const { value, done } = await reader.read();
                 if (done) break;
-
                 const chunk = decoder.decode(value, { stream: true });
                 const lines = chunk.split("\n\n");
-
                 for (const line of lines) {
                     if (line.startsWith("data: ")) {
                         try {
                             const data = JSON.parse(line.replace("data: ", ""));
                             if (data.type === "tool") {
-                                setMessages((prev) => [...prev, { role: "tool", content: data.content }]);
+                                setMessages(prev => [...prev, { role: "tool", content: data.content }]);
                             } else if (data.type === "text") {
-                                accumulatedAiResponse = data.content;
-                                setStreamingMessage(accumulatedAiResponse); // Update the visual buffer
+                                accumulatedText = data.content;
+                                setStreamingMessage(accumulatedText);
                             }
-                        } catch (e) {
-                            console.error("Error parsing JSON chunk", e);
-                        }
+                        } catch (e) { console.error("Parse error", e); }
                     }
                 }
             }
-
-            // Commit final message to state and clear buffer
-            setMessages((prev) => [...prev, { role: "ai", content: accumulatedAiResponse }]);
+            setMessages(prev => [...prev, { role: "ai", content: accumulatedText }]);
             setStreamingMessage("");
         } catch (error) {
-            console.error("Failed to fetch:", error);
+            console.error(error);
         } finally {
             setIsLoading(false);
         }
     };
 
     return (
-        <div className="flex flex-col h-full max-w-4xl mx-auto w-full p-4">
-            <ScrollArea className="flex-1 pr-4" ref={scrollRef}>
-                <div className="space-y-4 pb-4" style={{maxHeight: "75vh"}}>
-                    {messages.map((msg, i) => (
-                        <div key={i} className={`flex ${msg.role === "human" ? "justify-end" : "justify-start"}`}>
-                            {msg.role === "tool" ? (
-                                <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/50 px-3 py-1 rounded-full border border-border animate-pulse">
-                                    <Search className="w-3 h-3" />
-                                    {msg.content}
+        <div className="flex flex-col h-full max-w-4xl mx-auto w-full p-4 relative">
+            <AnimatePresence mode="wait">
+                {!currentSessionId ? (
+                    <motion.div
+                        key="welcome"
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        className="flex-1 flex flex-col items-center justify-center text-center space-y-6"
+                    >
+                        <div className="p-4 bg-primary/10 rounded-full">
+                            <Sparkles className="w-12 h-12 text-primary" />
+                        </div>
+                        <h1 className="text-4xl font-bold tracking-tight">How can I help you today?</h1>
+                        <p className="text-muted-foreground max-w-md">
+                            I can search the web, analyze data, and remember our past conversations.
+                        </p>
+                    </motion.div>
+                ) : (
+                    <ScrollArea className="flex-1 pr-4" ref={scrollRef}>
+                        <div className="space-y-4 pb-4">
+                            {messages.map((msg, i) => (
+                                <div key={i} className={`flex ${msg.role === "human" ? "justify-end" : "justify-start"}`}>
+                                    {msg.role === "tool" ? (
+                                        <Badge variant="outline" className="animate-pulse flex gap-2 py-1 italic font-normal bg-muted/30">
+                                            <Search className="w-3 h-3" /> {msg.content}
+                                        </Badge>
+                                    ) : (
+                                        <Card className={`max-w-[85%] p-4 ${msg.role === "human" ? "bg-primary text-primary-foreground shadow-lg" : "bg-card border-border/50"}`}>
+                                            <div className="flex gap-3">
+                                                {msg.role === "ai" && <Bot className="w-5 h-5 mt-1 text-blue-500 flex-shrink-0" />}
+                                                <div className="text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none overflow-hidden">
+                                                    {msg.role === "ai" ? (
+                                                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                                                    ) : (
+                                                        <p className="whitespace-pre-wrap">{msg.content}</p>
+                                                    )}
+                                                </div>
+                                                {msg.role === "human" && <User className="w-5 h-5 mt-1 opacity-70 flex-shrink-0" />}
+                                            </div>
+                                        </Card>
+                                    )}
                                 </div>
-                            ) : (
-                                <Card className={`max-w-[80%] p-3 shadow-sm ${msg.role === "human" ? "bg-primary text-primary-foreground" : "bg-card"}`}>
-                                    <div className="flex items-start gap-3">
-                                        {msg.role === "ai" && <Bot className="w-5 h-5 mt-1 text-blue-500" />}
-                                        <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
-                                        {msg.role === "human" && <User className="w-5 h-5 mt-1 opacity-70" />}
-                                    </div>
-                                </Card>
+                            ))}
+
+                            {/* STREAMING BUFFER */}
+                            {streamingMessage && (
+                                <div className="flex justify-start">
+                                    <Card className="max-w-[85%] p-4 bg-card border-blue-500/20 shadow-md">
+                                        <div className="flex gap-3">
+                                            <Bot className="w-5 h-5 mt-1 text-blue-500 flex-shrink-0" />
+                                            <div className="text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none overflow-hidden">
+                                                <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingMessage}</ReactMarkdown>
+                                                <motion.span
+                                                    animate={{ opacity: [0, 1, 0] }}
+                                                    transition={{ repeat: Infinity, duration: 0.8 }}
+                                                    className="inline-block w-2 h-4 bg-primary ml-1 align-middle"
+                                                />
+                                            </div>
+                                        </div>
+                                    </Card>
+                                </div>
+                            )}
+
+                            {isLoading && !streamingMessage && (
+                                <div className="flex justify-start items-center gap-2 text-muted-foreground text-xs p-2">
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                    <span>Agent is processing...</span>
+                                </div>
                             )}
                         </div>
-                    ))}
+                    </ScrollArea>
+                )}
+            </AnimatePresence>
 
-                    {/* Visual buffer for real-time streaming */}
-                    {streamingMessage && (
-                        <div className="flex justify-start">
-                            <Card className="max-w-[80%] p-3 shadow-sm bg-card">
-                                <div className="flex items-start gap-3">
-                                    <Bot className="w-5 h-5 mt-1 text-blue-500" />
-                                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{streamingMessage}</p>
-                                </div>
-                            </Card>
-                        </div>
-                    )}
-                </div>
-            </ScrollArea>
-
-            <div className="pt-4 border-t border-border">
-                <div className="flex gap-2">
+            <div className="pt-4 border-t border-border mt-auto">
+                <div className="flex gap-2 relative">
                     <Input
-                        placeholder="Ask your agent anything..."
+                        placeholder="Type your message..."
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
-                        className="bg-muted/50 border-border"
+                        className="pr-12 py-6 bg-muted/30 border-border/50 focus-visible:ring-primary"
                         disabled={isLoading}
                     />
-                    <Button onClick={handleSendMessage} disabled={isLoading || !input.trim()} size="icon">
-                        <Send className="w-4 h-4" />
+                    <Button
+                        onClick={handleSendMessage}
+                        disabled={isLoading || !input.trim()}
+                        className="absolute right-1.5 top-1.5 h-9 w-9 rounded-md transition-all shadow-md"
+                        size="icon"
+                    >
+                        {isLoading ? <Loader2 className="animate-spin w-4 h-4" /> : <Send className="w-4 h-4" />}
                     </Button>
                 </div>
             </div>

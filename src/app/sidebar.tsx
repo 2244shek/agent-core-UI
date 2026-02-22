@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { useSearchParams, useRouter } from "next/navigation";
-import { MessageSquare, Plus, Sparkles, Menu, X, Loader2 } from "lucide-react";
+import { MessageSquare, Plus, Sparkles, Menu, X, Loader2, Pencil, Trash2, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { SystemStatusContext, type SystemStatus } from "@/context/system-status-context";
@@ -81,6 +81,128 @@ function SystemStatusBadge({
     );
 }
 
+// ── Session row with inline rename + delete ────────────────────────────────────
+function SessionRow({
+    session,
+    isActive,
+    isOffline,
+    onRename,
+    onDelete,
+}: {
+    session: { id: string; title: string };
+    isActive: boolean;
+    isOffline: boolean;
+    onRename: (id: string, newTitle: string) => Promise<void>;
+    onDelete: (id: string) => Promise<void>;
+}) {
+    const [isEditing, setIsEditing] = useState(false);
+    const [editValue, setEditValue] = useState(session.title);
+    const [isDeleting, setIsDeleting] = useState(false);
+    const inputRef = useRef<HTMLInputElement>(null);
+
+    const startEdit = (e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setEditValue(session.title);
+        setIsEditing(true);
+        setTimeout(() => inputRef.current?.select(), 0);
+    };
+
+    const commitRename = async () => {
+        const trimmed = editValue.trim();
+        if (trimmed && trimmed !== session.title) {
+            await onRename(session.id, trimmed);
+        }
+        setIsEditing(false);
+    };
+
+    const handleKeyDown = (e: React.KeyboardEvent) => {
+        if (e.key === "Enter") commitRename();
+        if (e.key === "Escape") { setEditValue(session.title); setIsEditing(false); }
+    };
+
+    const handleDelete = async (e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDeleting(true);
+        await onDelete(session.id);
+        setIsDeleting(false);
+    };
+
+    const baseClass = "group flex items-center gap-2 px-2 py-2 text-sm rounded-lg transition-all";
+    const stateClass = isActive
+        ? "bg-accent text-accent-foreground shadow-sm"
+        : "hover:bg-muted/50 text-muted-foreground hover:text-foreground";
+    const disabledClass = "opacity-50 cursor-not-allowed text-muted-foreground";
+
+    if (isOffline) {
+        return (
+            <div className={`${baseClass} ${disabledClass}`} title="System offline — navigation disabled">
+                <MessageSquare className="w-4 h-4 flex-shrink-0" />
+                <span className="truncate flex-1 font-medium">{session.title}</span>
+            </div>
+        );
+    }
+
+    return (
+        <div className={`${baseClass} ${stateClass} relative`}>
+            {isEditing ? (
+                /* ── Inline rename input ── */
+                <>
+                    <MessageSquare className="w-4 h-4 flex-shrink-0 text-primary" />
+                    <input
+                        ref={inputRef}
+                        value={editValue}
+                        onChange={(e) => setEditValue(e.target.value)}
+                        onBlur={commitRename}
+                        onKeyDown={handleKeyDown}
+                        className="flex-1 bg-background border border-primary/50 rounded px-2 py-0.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary/40 min-w-0"
+                        maxLength={80}
+                    />
+                    <button
+                        onMouseDown={(e) => { e.preventDefault(); commitRename(); }}
+                        className="p-1 rounded hover:bg-primary/10 text-primary flex-shrink-0"
+                        title="Save"
+                    >
+                        <Check className="w-3 h-3" />
+                    </button>
+                </>
+            ) : (
+                /* ── Normal row ── */
+                <>
+                    <Link href={`/?session=${session.id}`} className="flex items-center gap-2 flex-1 min-w-0">
+                        <MessageSquare
+                            className={`w-4 h-4 flex-shrink-0 ${isActive ? "text-primary" : "text-muted-foreground"}`}
+                        />
+                        <span className="truncate font-medium">{session.title}</span>
+                    </Link>
+
+                    {/* Action buttons — revealed on row hover */}
+                    <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+                        <button
+                            onClick={startEdit}
+                            className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                            title="Rename"
+                        >
+                            <Pencil className="w-3 h-3" />
+                        </button>
+                        <button
+                            onClick={handleDelete}
+                            disabled={isDeleting}
+                            className="p-1 rounded hover:bg-red-500/10 text-muted-foreground hover:text-red-400 transition-colors disabled:opacity-50"
+                            title="Delete"
+                        >
+                            {isDeleting
+                                ? <Loader2 className="w-3 h-3 animate-spin" />
+                                : <Trash2 className="w-3 h-3" />}
+                        </button>
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
 // ── Sidebar content ────────────────────────────────────────────────────────────
 function SidebarContent({
     sessions,
@@ -90,6 +212,8 @@ function SidebarContent({
     systemStatus,
     systemFailures,
     isLoadingSessions,
+    onRename,
+    onDelete,
 }: {
     sessions: { id: string; title: string }[];
     currentSessionId: string | null;
@@ -98,6 +222,8 @@ function SidebarContent({
     systemStatus: SystemStatus;
     systemFailures: string[];
     isLoadingSessions: boolean;
+    onRename: (id: string, newTitle: string) => Promise<void>;
+    onDelete: (id: string) => Promise<void>;
 }) {
     return (
         <>
@@ -158,36 +284,16 @@ function SidebarContent({
                         {sessions.length === 0 ? (
                             <p className="text-xs text-center text-muted-foreground py-10">No sessions yet</p>
                         ) : (
-                            sessions.map((session) => {
-                                const isOffline = systemStatus === "offline";
-                                const baseClass = `flex items-center gap-3 p-3 text-sm rounded-lg transition-all`;
-                                const activeClass = currentSessionId === session.id
-                                    ? "bg-accent text-accent-foreground shadow-sm"
-                                    : "hover:bg-muted/50 text-muted-foreground hover:text-foreground";
-                                const disabledClass = "opacity-50 cursor-not-allowed text-muted-foreground";
-
-                                return isOffline ? (
-                                    <div
-                                        key={session.id}
-                                        className={`${baseClass} ${disabledClass}`}
-                                        title="System offline — navigation disabled"
-                                    >
-                                        <MessageSquare className="w-4 h-4 flex-shrink-0 text-muted-foreground" />
-                                        <span className="truncate font-medium">{session.title}</span>
-                                    </div>
-                                ) : (
-                                    <Link
-                                        key={session.id}
-                                        href={`/?session=${session.id}`}
-                                        className={`${baseClass} ${activeClass}`}
-                                    >
-                                        <MessageSquare
-                                            className={`w-4 h-4 flex-shrink-0 ${currentSessionId === session.id ? "text-primary" : "text-muted-foreground"}`}
-                                        />
-                                        <span className="truncate font-medium">{session.title}</span>
-                                    </Link>
-                                );
-                            })
+                            sessions.map((session) => (
+                                <SessionRow
+                                    key={session.id}
+                                    session={session}
+                                    isActive={currentSessionId === session.id}
+                                    isOffline={systemStatus === "offline"}
+                                    onRename={onRename}
+                                    onDelete={onDelete}
+                                />
+                            ))
                         )}
                     </div>
                 )}
@@ -304,6 +410,36 @@ export default function Sidebar({ children }: { children: React.ReactNode }) {
         setSidebarOpen(false);
     };
 
+    const handleRename = useCallback(async (id: string, newTitle: string) => {
+        // Optimistic update
+        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, title: newTitle } : s));
+        try {
+            await fetch(`http://localhost:8000/api/v1/agent/sessions/${id}`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: newTitle }),
+            });
+        } catch {
+            // Revert on failure
+            fetchSessions();
+        }
+    }, [fetchSessions]);
+
+    const handleDelete = useCallback(async (id: string) => {
+        // Optimistic remove from list
+        setSessions((prev) => prev.filter((s) => s.id !== id));
+        // If deleting the active session, go back to home
+        if (currentSessionId === id) router.push("/");
+        try {
+            await fetch(`http://localhost:8000/api/v1/agent/sessions/${id}`, {
+                method: "DELETE",
+            });
+        } catch {
+            // Revert on failure
+            fetchSessions();
+        }
+    }, [currentSessionId, fetchSessions, router]);
+
     const sidebarProps = {
         sessions,
         currentSessionId,
@@ -311,6 +447,8 @@ export default function Sidebar({ children }: { children: React.ReactNode }) {
         systemStatus,
         systemFailures,
         isLoadingSessions,
+        onRename: handleRename,
+        onDelete: handleDelete,
     };
 
     return (
